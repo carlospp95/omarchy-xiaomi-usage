@@ -1,0 +1,780 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Xiaomi MiMo token plan usage record as JSON
+# omarchy:args=[--force]
+# omarchy:hidden=true
+"""Collect Xiaomi MiMo token-plan usage into one display-ready JSON record.
+
+Local stats come from opencode sessions that ran on a Xiaomi token-plan
+provider (`xiaomi`, `xiaomi-token-plan-ams`, `xiaomi-token-plan-cn`,
+`xiaomi-token-plan-sgp`; the `mimo-*` models) and from pi/omp sessions on the
+same providers. Credentials resolve from ~/.config/omarchy/agents/xiaomi.json,
+XIAOMI_API_KEY/MIMO_API_KEY, the live credentials opencode stores in
+~/.local/share/opencode/auth.json, and the ~/.pi|~/.omp agent .env files.
+
+Plan limits are optional: unlike Z.ai, Xiaomi's token-plan API host exposes
+no quota endpoint for the `tp-` API key — the console
+(https://platform.xiaomimimo.com) answers only to an authenticated browser
+session. If the user pastes that session Cookie header into the config file
+(`{"cookie": "serviceToken=...; userId=..."}`) this collector probes the
+undocumented console endpoints /api/v1/tokenPlan/usage (monthly and
+per-cycle token windows, used/limit/percent) and /api/v1/tokenPlan/detail
+(plan name and current period end). The shape may change at any time and any
+failure there degrades to local stats alone without touching the record's
+readiness. The record is the only contract; the agents panel only ever reads
+the JSON this prints.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import stat
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterator
+
+AGENT_ID = "xiaomi"
+AGENT_NAME = "Xiaomi"
+AUTH_HELP_NO_LIMITS = (
+  "Token counts update locally. For plan limits, paste the platform "
+  "(platform.xiaomimimo.com) session Cookie into ~/.config/omarchy/agents/xiaomi.json."
+)
+
+# OpenAI-compatible token-plan hosts (where the tp- key works for inference).
+# The console is the only known source of plan limits and it wants a session
+# cookie, not the API key.
+CONSOLE_ORIGIN = "https://platform.xiaomimimo.com"
+USAGE_PATH = "/api/v1/tokenPlan/usage"
+DETAIL_PATH = "/api/v1/tokenPlan/detail"
+
+# Window labels for the console's item names; unknown names keep a generic
+# label so a console change adds a row instead of vanishing.
+ITEM_LABELS = {
+  "plan_total_token": "Plan tokens (cycle)",
+  "month_total_token": "Monthly tokens",
+  "compensation_total_token": "Compensation tokens",
+}
+
+# Every provider id opencode records for Xiaomi-hosted traffic. The gate
+# keeps '"xiaomi' unterminated so xiaomi-token-plan-* variants pass it too.
+OPENCODE_PROVIDERS = (
+  "xiaomi",
+  "xiaomi-token-plan-ams",
+  "xiaomi-token-plan-cn",
+  "xiaomi-token-plan-sgp",
+)
+
+# A scan this recent is only reused to dedup concurrent collector runs.
+SCAN_REUSE_SECONDS = 20
+# Console probes are the user's own browser session — be polite with them.
+PROBE_MIN_INTERVAL_SECONDS = 60
+
+now = datetime.now()
+today = now.strftime("%Y-%m-%d")
+recent_dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+
+
+def number(value: Any) -> int:
+  try:
+    return max(0, int(value or 0))
+  except (TypeError, ValueError):
+    return 0
+
+
+def local_day(value: Any) -> str:
+  if value is None:
+    return datetime.now().strftime("%Y-%m-%d")
+  if isinstance(value, (int, float)):
+    # opencode/pi message timestamps are milliseconds.
+    if value > 10_000_000_000:
+      value = value / 1000
+    return datetime.fromtimestamp(value).strftime("%Y-%m-%d")
+  text = str(value)
+  try:
+    if text.endswith("Z"):
+      dt = datetime.fromisoformat(text[:-1] + "+00:00")
+    else:
+      dt = datetime.fromisoformat(text)
+    if dt.tzinfo is not None:
+      dt = dt.astimezone()
+    return dt.strftime("%Y-%m-%d")
+  except ValueError:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def empty_bucket() -> dict[str, int]:
+  return {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+  }
+
+
+def empty_stats() -> dict[str, Any]:
+  return {
+    "todayPrompts": 0,
+    "todaySessions": 0,
+    "todayTotalTokens": 0,
+    "todayTokensByModel": {},
+    "recentDays": [],
+    "totalPrompts": 0,
+    "totalSessions": 0,
+    "activeDays": 0,
+    "activeDates": [],
+    "modelUsage": {},
+  }
+
+
+def base_record(**overrides: Any) -> dict[str, Any]:
+  record: dict[str, Any] = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+    "ready": False,
+    "hasLocalStats": False,
+    "hasPromptStats": True,
+    "tierLabel": "",
+    "usageStatusText": "",
+    "authHelpText": AUTH_HELP_NO_LIMITS,
+    "limits": [],
+  }
+  record.update(empty_stats())
+  record.update(overrides)
+  return record
+
+
+# --------------------------------------------------------------------------
+# Cache primitives (shared by the local-stats scan and the limits probe)
+# --------------------------------------------------------------------------
+
+def cache_root() -> Path:
+  root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
+
+
+def read_fresh_json(path: Path, max_age_seconds: float) -> Any:
+  if max_age_seconds <= 0 or not path.exists():
+    return None
+  try:
+    # A negative age means the mtime is in the future: the clock moved
+    # backwards since the write, so the cache's freshness cannot be trusted.
+    age = time.time() - path.stat().st_mtime
+    if 0 <= age <= max_age_seconds:
+      return json.loads(path.read_text(encoding="utf-8"))
+  except Exception:
+    return None
+  return None
+
+
+def write_json(path: Path, payload: Any) -> None:
+  # A temp name unique to this writer, not derived from the target: several
+  # collectors can run at once, and a shared temp path means the second
+  # replace finds the first one's file already moved away.
+  handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+  tmp = Path(tmp_name)
+  try:
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    tmp.chmod(0o644)
+    tmp.replace(path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
+
+
+@contextlib.contextmanager
+def exclusive_lock(path: Path) -> Iterator[None]:
+  """Hold flock on `path` for the block, or run the block unlocked.
+
+  The lock names are predictable paths in a user-writable directory, so what
+  sits at the path may not be this plugin's own file. The open follows no
+  symlinks, creates exclusively, truncates nothing (a lock carries no
+  content) and blocks on nothing (a planted fifo must not hang the run);
+  fstat then confirms a regular file, owned by this user, without group or
+  other write bits. Anything else — including a symlink planted at the
+  path — means no lock: the lock only serializes concurrent collectors, and
+  running without it beats both refusing to run and touching the target.
+  """
+  fd: int | None = None
+  try:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+      fd = os.open(path, flags | os.O_EXCL, 0o600)
+    except FileExistsError:
+      fd = os.open(path, flags)
+    info = os.fstat(fd)
+    if (
+      not stat.S_ISREG(info.st_mode)
+      or info.st_nlink == 0
+      or info.st_uid != os.geteuid()
+      or info.st_mode & 0o022
+    ):
+      os.close(fd)
+      fd = None
+  except OSError:
+    if fd is not None:
+      os.close(fd)
+    fd = None
+  if fd is not None:
+    try:
+      fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+      os.close(fd)
+      fd = None
+  try:
+    yield
+  finally:
+    if fd is not None:
+      os.close(fd)
+
+
+# --------------------------------------------------------------------------
+# Credentials
+# --------------------------------------------------------------------------
+
+def read_env_file(path: Path) -> dict[str, str]:
+  values: dict[str, str] = {}
+  try:
+    for line in path.read_text().splitlines():
+      line = line.strip()
+      if line.startswith("export "):
+        line = line[len("export "):].strip()
+      if not line or line.startswith("#") or "=" not in line:
+        continue
+      key, _, val = line.partition("=")
+      values[key.strip()] = val.strip().strip("'\"")
+  except OSError:
+    return {}
+  return values
+
+
+def read_config() -> dict[str, Any]:
+  config_home = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+  try:
+    parsed = json.loads((config_home / "omarchy" / "agents" / "xiaomi.json").read_text())
+    return parsed if isinstance(parsed, dict) else {}
+  except (OSError, json.JSONDecodeError):
+    return {}
+
+
+def credentials() -> tuple[str, str]:
+  """Return (api_key, cookie).
+
+  The api key only proves which account is in play (the collector never
+  calls an inference-host endpoint with it today); the cookie, when the user
+  supplies one, is what unlocks the console limits probe.
+  """
+  config = read_config()
+  api_key = str(config.get("apiKey") or "").strip()
+  cookie = str(config.get("cookie") or "").strip()
+
+  if not api_key:
+    api_key = (
+      os.environ.get("XIAOMI_API_KEY")
+      or os.environ.get("MIMO_API_KEY")
+      or ""
+    ).strip()
+
+  if not api_key:
+    # Live credentials opencode stores: one entry per provider id, all the
+    # Xiaomi token-plan regions holding the same tp- key in practice.
+    opencode_auth = (
+      Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+      / "opencode" / "auth.json"
+    )
+    try:
+      parsed = json.loads(opencode_auth.read_text())
+    except (OSError, ValueError):
+      parsed = {}
+    if isinstance(parsed, dict):
+      for provider_id, credential in parsed.items():
+        if not str(provider_id).lower().startswith("xiaomi"):
+          continue
+        if isinstance(credential, dict) and str(credential.get("key") or "").strip():
+          api_key = str(credential["key"]).strip()
+          break
+
+  if not api_key:
+    for env_path in (
+      Path.home() / ".omp" / "agent" / ".env",
+      Path.home() / ".pi" / "agent" / ".env",
+    ):
+      values = read_env_file(env_path)
+      found = values.get("XIAOMI_API_KEY") or values.get("MIMO_API_KEY")
+      if found:
+        api_key = found
+        break
+
+  return api_key, cookie
+
+
+# --------------------------------------------------------------------------
+# Coding-plan limits (optional console probe)
+# --------------------------------------------------------------------------
+
+def iso_from_console_date(value: Any) -> str:
+  """Parse "2026-10-22 23:59:59" into ISO with UTC.
+
+  The console sends no timezone. UTC is the documented assumption: the
+  consumer of this field is a monthly-reset meter, where a few hours of
+  drift is harmless.
+  """
+  text = str(value or "").strip()
+  if not text:
+    return ""
+  try:
+    return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).isoformat()
+  except ValueError:
+    return ""
+
+
+def console_get(path: str, cookie: str) -> dict[str, Any] | int | str:
+  """GET a console endpoint; returns the parsed body or an error marker.
+
+  An expired session answers 401 with a JSON body carrying a loginUrl;
+  anything else non-200 is reported by code.
+  """
+  request = urllib.request.Request(
+    CONSOLE_ORIGIN + path,
+    method="GET",
+    headers={
+      "Cookie": cookie,
+      "Accept": "application/json",
+      "X-Requested-With": "XMLHttpRequest",
+    },
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=15) as response:
+      body = json.loads(response.read(1_048_576))
+  except urllib.error.HTTPError as error:
+    if error.code in (401, 403):
+      return "cookieExpired"
+    return error.code
+  except (urllib.error.URLError, TimeoutError):
+    return "transport"
+  except json.JSONDecodeError:
+    return "invalid"
+  return body if isinstance(body, dict) else "invalid"
+
+
+def parse_window_items(block: Any, fallback_label: str) -> list[dict[str, Any]]:
+  """Turn one usage block's items into panel limit rows.
+
+  The console reports fractions (0.0123 == 1.23%); a used/limit pair is the
+  preferred source where a percent field disagrees. Zero-limit rows (an
+  empty compensation allowance, typically) are skipped: a 0-of-0 meter is
+  meaningless, not "fresh".
+  """
+  rows: list[dict[str, Any]] = []
+  if not isinstance(block, dict):
+    return rows
+  items = block.get("items")
+  if not isinstance(items, list):
+    items = [block]
+  for item in items:
+    if not isinstance(item, dict):
+      continue
+    limit = number(item.get("limit"))
+    used = number(item.get("used"))
+    if limit <= 0:
+      continue
+    percent = used / limit
+    try:
+      reported = float(item.get("percent"))
+      if 0.0 <= reported <= 1.0:
+        percent = reported
+    except (TypeError, ValueError):
+      pass
+    name = str(item.get("name") or "").strip()
+    label = ITEM_LABELS.get(name, fallback_label if len(items) == 1 else (name or "Usage window"))
+    rows.append({"label": label[:64], "percent": max(0.0, min(1.0, percent)), "resetsAt": ""})
+  return rows
+
+
+def fetch_limits(cookie: str) -> dict[str, Any]:
+  """Probe the console for plan limits.
+
+  /api/v1/tokenPlan/usage carries the token windows (monthly and
+  subscription cycle); /api/v1/tokenPlan/detail carries the plan name and
+  the current period end, used as the rows' reset time. On any failure
+  returns {"status": str} describing why no limits are available.
+  """
+  usage = console_get(USAGE_PATH, cookie)
+  if usage == "cookieExpired":
+    return {"status": "Xiaomi session expired; refresh the cookie in ~/.config/omarchy/agents/xiaomi.json", "cookieExpired": True}
+  if usage == "transport":
+    return {"status": "Could not reach the Xiaomi console", "transport": True}
+  if isinstance(usage, int) or isinstance(usage, str):
+    return {"status": f"Xiaomi console unavailable ({usage})"}
+  if usage.get("code") not in (0, None) or not isinstance(usage.get("data"), dict):
+    msg = str(usage.get("message") or "").strip()[:200]
+    return {"status": msg or "Unrecognized response from the Xiaomi console"}
+
+  data = usage["data"]
+  # Xiaomi token plans are monthly: lead with the monthly window. The
+  # per-cycle "usage" block is only a fallback for consoles that stop
+  # reporting monthUsage — listing both would read as two quotas when they
+  # describe the same monthly allowance.
+  limits = parse_window_items(data.get("monthUsage"), "Monthly tokens")
+  if not limits:
+    limits = parse_window_items(data.get("usage"), "Monthly tokens")
+
+  detail = console_get(DETAIL_PATH, cookie)
+  tier = ""
+  resets_at = ""
+  if isinstance(detail, dict) and detail.get("code") in (0, None) and isinstance(detail.get("data"), dict):
+    info = detail["data"]
+    tier = str(info.get("planName") or "").strip()[:64]
+    resets_at = iso_from_console_date(info.get("currentPeriodEnd"))
+  if resets_at:
+    for entry in limits:
+      entry["resetsAt"] = resets_at
+
+  if not limits:
+    return {"status": "Xiaomi console answered without usable quota windows"}
+  return {"limits": limits, "tierLabel": tier}
+
+
+def collect_limits(cookie: str, force: bool) -> dict[str, Any]:
+  """Fresh limits when a probe is due, else the last known ones."""
+  result = {"limits": [], "tierLabel": "", "usageStatusText": ""}
+
+  probe_cache = cache_root() / "xiaomi-limits.json"
+  cached = read_fresh_json(probe_cache, float("inf")) or {}
+  if not isinstance(cached, dict):
+    cached = {}
+  fetched_at = number(cached.get("fetchedAtMs")) / 1000
+  if not force and cached.get("limits") and time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
+    result["limits"] = cached["limits"]
+    result["tierLabel"] = str(cached.get("tierLabel") or "")
+    return result
+
+  with exclusive_lock(cache_root() / "xiaomi-limits.lock"):
+    if not force:
+      cached = read_fresh_json(probe_cache, float("inf")) or {}
+      if not isinstance(cached, dict):
+        cached = {}
+      fetched_at = number(cached.get("fetchedAtMs")) / 1000
+      if cached.get("limits") and time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
+        result["limits"] = cached["limits"]
+        result["tierLabel"] = str(cached.get("tierLabel") or "")
+        return result
+
+    probe = fetch_limits(cookie)
+    if probe.get("limits"):
+      result["limits"] = probe["limits"]
+      result["tierLabel"] = probe.get("tierLabel", "")
+      try:
+        write_json(probe_cache, {
+          "fetchedAtMs": round(time.time() * 1000),
+          "limits": probe["limits"],
+          "tierLabel": result["tierLabel"],
+        })
+      except Exception as exc:
+        print(f"omarchy-agent-usage-xiaomi: could not write limits cache ({exc})", file=sys.stderr)
+      return result
+
+  result["usageStatusText"] = probe.get("status", "")
+  return result
+
+
+# --------------------------------------------------------------------------
+# Local session stats
+# --------------------------------------------------------------------------
+
+# The aggregation state is module-level so the pi/omp scan and the opencode
+# scan contribute to the same totals; reset_stats() scopes one scan run.
+_stats_state: dict[str, Any] = {}
+
+
+def reset_stats() -> None:
+  _stats_state.clear()
+  _stats_state.update({
+    "recent": {day: {"date": day, "messageCount": 0} for day in recent_dates},
+    "model_usage": {},
+    "today_by_model": {},
+    "active_dates": set(),
+    "total_sessions": set(),
+    "today_sessions": set(),
+    "seen": set(),
+    "today_prompts": 0,
+    "today_tokens": 0,
+    "total_prompts": 0,
+  })
+
+
+def record_usage(day: str, session_key: str, model: str, inp: int, out: int, cread: int, cwrite: int) -> None:
+  total = inp + out + cread + cwrite
+  state = _stats_state
+  state["total_prompts"] += 1
+  state["total_sessions"].add(session_key)
+  state["active_dates"].add(day)
+  bucket = state["model_usage"].setdefault(model, empty_bucket())
+  bucket["inputTokens"] += inp
+  bucket["outputTokens"] += out
+  bucket["cacheReadInputTokens"] += cread
+  bucket["cacheCreationInputTokens"] += cwrite
+  if day in state["recent"]:
+    state["recent"][day]["messageCount"] += total
+  if day == today:
+    state["today_prompts"] += 1
+    state["today_sessions"].add(session_key)
+    state["today_tokens"] += total
+    state["today_by_model"][model] = state["today_by_model"].get(model, 0) + total
+
+
+def build_stats() -> dict[str, Any]:
+  state = _stats_state
+  return {
+    "hasLocalStats": bool(state["model_usage"]),
+    "todayPrompts": state["today_prompts"],
+    "todaySessions": len(state["today_sessions"]),
+    "todayTotalTokens": state["today_tokens"],
+    "todayTokensByModel": state["today_by_model"],
+    "recentDays": [state["recent"][day] for day in recent_dates],
+    "totalPrompts": state["total_prompts"],
+    "totalSessions": len(state["total_sessions"]),
+    "activeDays": len(state["active_dates"]),
+    "activeDates": sorted(state["active_dates"]),
+    "modelUsage": state["model_usage"],
+  }
+
+
+def scan_pi_sessions() -> None:
+  roots = [
+    Path.home() / ".pi" / "agent" / "sessions",
+    Path.home() / ".omp" / "agent" / "sessions",
+  ]
+  for root in roots:
+    if not root.exists():
+      continue
+    for path in root.rglob("*.jsonl"):
+      try:
+        handle = path.open(errors="replace")
+      except OSError:
+        continue
+      with handle:
+        for line in handle:
+          # Cheap substring gate before the JSON parse: an assistant turn on
+          # a Xiaomi provider always carries both markers. The gates stay
+          # unterminated so xiaomi-token-plan-* variants pass them too.
+          if '"usage"' not in line or ('"xiaomi' not in line and '"mimo' not in line):
+            continue
+          try:
+            entry = json.loads(line)
+          except json.JSONDecodeError:
+            continue
+          if not isinstance(entry, dict) or entry.get("type") != "message":
+            continue
+          message = entry.get("message")
+          if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+          provider = str(message.get("provider") or "").lower()
+          if provider not in OPENCODE_PROVIDERS and provider != "mimo":
+            continue
+          usage = message.get("usage")
+          if not isinstance(usage, dict):
+            continue
+          inp = number(usage.get("input"))
+          # pi reports reasoning tokens apart from output; both are generated.
+          out = number(usage.get("output")) + number(usage.get("reasoning"))
+          cread = number(usage.get("cacheRead"))
+          cwrite = number(usage.get("cacheWrite"))
+          if not (inp or out or cread or cwrite):
+            inp = number(usage.get("totalTokens"))
+          if not (inp or out or cread or cwrite):
+            continue
+          message_key = str(path) + ":" + str(entry.get("id") or "")
+          if message_key in _stats_state["seen"]:
+            continue
+          _stats_state["seen"].add(message_key)
+          day = local_day(entry.get("timestamp") or message.get("timestamp"))
+          model = str(message.get("model") or "mimo")
+          record_usage(day, str(path), model, inp, out, cread, cwrite)
+
+
+def scan_opencode_sessions() -> bool:
+  """Count opencode messages that ran on a Xiaomi provider.
+
+  Read-only: opencode may be writing right now. Returns whether the scan ran
+  to completion: a scan cut short by a database error still contributes what
+  it read, but must not be cached as if it were the whole story.
+  """
+  import sqlite3
+
+  db = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode" / "opencode.db"
+  if not db.is_file():
+    return True
+  try:
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+  except sqlite3.Error:
+    return False
+  try:
+    conn.execute("PRAGMA query_only = ON")
+    # LIKE gates skip rows whose JSON cannot hold the pair, avoiding the
+    # parse of tens-of-MB blobs; json_extract on json_valid rows is the
+    # authority. The gates are independent, not a pair pattern, so JSON
+    # spacing cannot drop a row, and '"xiaomi' stays unterminated so
+    # xiaomi-token-plan-* passes it too. One malformed row must not abort
+    # the scan: the per-row try/except stays the final safety net.
+    placeholders = ", ".join("?" for _ in OPENCODE_PROVIDERS)
+    for session_id, raw in conn.execute(
+      "SELECT session_id, data FROM message"
+      " WHERE data LIKE '%\"providerID\"%'"
+      " AND (data LIKE '%\"xiaomi%' OR data LIKE '%\"mimo%')"
+      " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END = 'assistant'"
+      f" AND CASE WHEN json_valid(data) THEN json_extract(data, '$.providerID') END IN ({placeholders})",
+      OPENCODE_PROVIDERS,
+    ):
+      try:
+        entry = json.loads(raw)
+        if not isinstance(entry, dict) or entry.get("role") != "assistant":
+          continue
+        tokens = entry.get("tokens") or {}
+        cache = tokens.get("cache") or {}
+        inp = number(tokens.get("input"))
+        # opencode keeps thinking tokens out of output; both are generated.
+        out = number(tokens.get("output")) + number(tokens.get("reasoning"))
+        cread = number(cache.get("read"))
+        cwrite = number(cache.get("write"))
+        if not (inp or out or cread or cwrite):
+          continue
+        day = local_day((entry.get("time") or {}).get("created"))
+        model = str(entry.get("modelID") or "mimo").rstrip("/").split("/")[-1] or "mimo"
+      except Exception:
+        continue
+      record_usage(day, "opencode:" + str(session_id), model, inp, out, cread, cwrite)
+  except sqlite3.Error:
+    # Transient lock, schema migration, corruption: the numbers stop here,
+    # incomplete.
+    return False
+  finally:
+    conn.close()
+  return True
+
+
+def scan_sessions() -> tuple[dict[str, Any], bool]:
+  reset_stats()
+  scan_pi_sessions()
+  complete = scan_opencode_sessions()
+  return build_stats(), complete
+
+
+def scan_cache_paths() -> tuple[Path, Path]:
+  # The digest covers every data path the scan reads (both session roots live
+  # under the home directory).
+  digest = hashlib.sha1(str(Path.home()).encode("utf-8")).hexdigest()[:16]
+  root = cache_root()
+  return root / f"xiaomi-scan-{digest}.json", root / f"xiaomi-scan-{digest}.lock"
+
+
+def read_cached_stats(cache_file: Path, max_age_seconds: float) -> dict[str, Any] | None:
+  cached = read_fresh_json(cache_file, max_age_seconds)
+  if not isinstance(cached, dict) or cached.get("schemaVersion") != 1:
+    return None
+  # today* fields only mean "today" on the day they were scanned. A cache from
+  # another local date (midnight passed, or the clock moved) is a miss.
+  if cached.get("scanDate") != today:
+    return None
+  stats = cached.get("stats")
+  if not isinstance(stats, dict):
+    return None
+  if not all(key in stats for key in ("todayPrompts", "todayTotalTokens", "recentDays", "activeDates", "modelUsage")):
+    return None
+  return stats
+
+
+def write_cached_stats(cache_file: Path, stats: dict[str, Any]) -> None:
+  try:
+    write_json(cache_file, {"schemaVersion": 1, "scanDate": today, "stats": stats})
+  except Exception as exc:
+    print(f"omarchy-agent-usage-xiaomi: could not write usage cache ({exc})", file=sys.stderr)
+
+
+def cached_local_stats(max_age: float) -> dict[str, Any]:
+  """Local stats, with the cache as a pure optimization.
+
+  Any cache-layer failure degrades to a direct scan and a warning: the JSON
+  record is the contract, the cache is not.
+  """
+  try:
+    return _cached_local_stats(max_age)
+  except Exception as exc:
+    print(f"omarchy-agent-usage-xiaomi: cache unavailable ({exc}); scanning directly", file=sys.stderr)
+    stats, _ = scan_sessions()
+    return stats
+
+
+def _cached_local_stats(max_age: float) -> dict[str, Any]:
+  cache_file, lock_file = scan_cache_paths()
+
+  cached = read_cached_stats(cache_file, max_age)
+  if cached is not None:
+    return cached
+
+  with exclusive_lock(lock_file):
+    cached = read_cached_stats(cache_file, max_age)
+    if cached is not None:
+      return cached
+    stats, complete = scan_sessions()
+    # An interrupted scan still serves this run, but caching it would
+    # suppress the missing usage for every reader until the cache expires.
+    if complete:
+      write_cached_stats(cache_file, stats)
+    return stats
+
+
+# --------------------------------------------------------------------------
+# Assembly
+# --------------------------------------------------------------------------
+
+def scan(force: bool) -> dict[str, Any]:
+  record = base_record()
+  max_age = 0 if force else SCAN_REUSE_SECONDS
+  record.update(cached_local_stats(max_age))
+
+  api_key, cookie = credentials()
+  if cookie:
+    limits = collect_limits(cookie, force)
+    record["limits"] = limits["limits"]
+    if limits["tierLabel"]:
+      record["tierLabel"] = limits["tierLabel"]
+    record["usageStatusText"] = limits["usageStatusText"]
+    if record["limits"]:
+      record["authHelpText"] = ""
+    elif not record["usageStatusText"]:
+      record["usageStatusText"] = "No quota windows available"
+
+  record["ready"] = bool(record["limits"] or record["hasLocalStats"])
+  return record
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description="Print the Xiaomi MiMo usage record as JSON")
+  # --force rescans and re-probes, ignoring both caches.
+  parser.add_argument("--force", action="store_true")
+  args = parser.parse_args()
+
+  try:
+    record = scan(args.force)
+  except Exception as error:  # noqa: BLE001 - a collector must always emit a record
+    record = base_record(usageStatusText="Xiaomi unavailable", authHelpText="Xiaomi usage scan failed")
+    print(f"omarchy-agent-usage-xiaomi: {type(error).__name__}", file=sys.stderr)
+  print(json.dumps(record, separators=(",", ":")))
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

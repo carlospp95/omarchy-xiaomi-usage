@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "xiaomi.agent-usage",
+  "name": "Xiaomi Agent Usage",
+  "version": "1.0.0",
+  "author": "Carlos",
+  "description": "Feeds Xiaomi MiMo token plan usage into the built-in agents panel.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
