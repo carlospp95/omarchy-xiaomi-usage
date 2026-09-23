@@ -34,32 +34,46 @@ The Xiaomi tab appears in the agents panel once the first record lands
   (`xiaomi`, `xiaomi-token-plan-ams`, `xiaomi-token-plan-cn`,
   `xiaomi-token-plan-sgp`; the `mimo-*` models) and from pi/omp sessions on
   the same providers: today, the last 7 days, and all-time totals.
-- **Plan limits** (optional): Xiaomi's token-plan API host accepts the `tp-`
-  key for inference only — there is no quota endpoint for it. The console
+- **Plan limits**: Xiaomi's token-plan API host accepts the `tp-` key for
+  inference only — there is no quota endpoint for it. The console
   (platform.xiaomimimo.com) answers only to an authenticated browser
-  session, so limits require you to paste that session Cookie header into
-  the config (see below). The collector probes the console's undocumented
-  `/api/v1/tokenPlan/usage` (monthly + per-cycle token windows) and
-  `/api/v1/tokenPlan/detail` (plan name, current period end) and parses
-  them defensively; the shape may change at any time.
+  session, and that session **renews automatically**: the collector reads
+  the Xiaomi account cookies (`passToken` and friends) from the local
+  Chromium-family browser store (Brave, Chrome, Chromium), decrypts them
+  with the browser's libsecret keyring secret, and drives the same silent
+  SSO hop chain the web client uses (`serviceLogin` -> `/sts`) to mint a
+  fresh `api-platform_serviceToken` whenever the previous one expires. As
+  long as you are signed into platform.xiaomimimo.com in one of those
+  browsers, the tab keeps its plan limits with zero maintenance.
 
-Without a cookie the tab still shows local stats, and `authHelpText` says how
-to add one.
+  The renewal reads cookies only for `*.account.xiaomi.com`, never sends
+  them anywhere but `*.xiaomi.com`, and can be disabled with
+  `{"browser": false}` in the config. A manual Cookie header pasted into the
+  config (see below) still wins over the automatic path when present.
+
+The collector probes the console's undocumented `/api/v1/tokenPlan/usage`
+(monthly token window) and `/api/v1/tokenPlan/detail` (plan name, current
+period end) and parses them defensively; the shape may change at any time.
+Without a usable session the tab still shows local stats, and `authHelpText`
+says how to get limits back.
 
 ## Configuration
 
 Optional: `~/.config/omarchy/agents/xiaomi.json`
 
 ```json
-{ "apiKey": "tp-...", "cookie": "serviceToken=...; userId=...; ..." }
+{ "browser": true }
 ```
 
+- `browser` (default `true`): keep the automatic session renewal on, or set
+  to `false` to stop reading the browser cookie store entirely.
+- `cookie` (optional, rarely needed): a manual `Cookie` header for
+  `platform.xiaomimimo.com` (DevTools > Network > any request > Request
+  Headers). When present it wins over the automatic path; if it expires the
+  collector falls back to renewal on the next refresh. Remove it to go back
+  to fully automatic.
 - `apiKey` is not used for network calls today; it exists so the collector
   can identify the account and for future inference-host endpoints.
-- `cookie` is the `Cookie` header your browser sends to
-  `platform.xiaomimimo.com` while logged in (DevTools > Network > any
-  request > Request Headers). It expires when the session does — the tab
-  will tell you when it's time to refresh it.
 
 The API key also resolves from `XIAOMI_API_KEY`/`MIMO_API_KEY`, the live
 `~/.local/share/opencode/auth.json` (`xiaomi*` providers), or
@@ -67,11 +81,13 @@ The API key also resolves from `XIAOMI_API_KEY`/`MIMO_API_KEY`, the live
 
 ## Credentials
 
-The collector looks for a cookie in this order:
+The console cookie resolves in this order:
 
-1. `cookie` in `~/.config/omarchy/agents/xiaomi.json`
-2. Nothing else — the console is the only source, and it only takes a
-   session cookie.
+1. `cookie` in `~/.config/omarchy/agents/xiaomi.json` (manual override)
+2. Automatic renewal: browser store -> libsecret decrypt -> SSO mint,
+   cached in `~/.cache/omarchy/agent-usage/xiaomi-session.json` until the
+   console rejects it, then re-minted (rate-limited to one attempt per 5
+   minutes)
 
 ## Details
 
@@ -94,10 +110,13 @@ The collector looks for a cookie in this order:
 ## Dependencies
 
 - `python3` (stdlib only — the collector uses no pip packages)
+- `openssl` (AES-128-CBC decryption of the browser cookie store; coreutils
+  of any Arch/Omarchy install)
+- `secret-tool` (libsecret CLI, ships with Omarchy's default `libsecret`)
 - `jq` (ships with Omarchy's default package set; used by `refresh.sh` to
   sanity-check the record before it lands)
-- Local token stats work with no configuration at all; plan limits need the
-  optional session cookie.
+- Local token stats work with no configuration at all; plan limits need a
+  Xiaomi account session in Brave/Chrome/Chromium (or a manual cookie).
 
 ## License
 

@@ -14,14 +14,25 @@ XIAOMI_API_KEY/MIMO_API_KEY, the live credentials opencode stores in
 Plan limits are optional: unlike Z.ai, Xiaomi's token-plan API host exposes
 no quota endpoint for the `tp-` API key — the console
 (https://platform.xiaomimimo.com) answers only to an authenticated browser
-session. If the user pastes that session Cookie header into the config file
-(`{"cookie": "serviceToken=...; userId=..."}`) this collector probes the
-undocumented console endpoints /api/v1/tokenPlan/usage (monthly and
-per-cycle token windows, used/limit/percent) and /api/v1/tokenPlan/detail
-(plan name and current period end). The shape may change at any time and any
-failure there degrades to local stats alone without touching the record's
-readiness. The record is the only contract; the agents panel only ever reads
-the JSON this prints.
+session. That session auto-renews in one of two ways, tried in order:
+
+1. Automatic renewal (default): the collector reads the Xiaomi *account*
+   cookies (passToken and friends on account.xiaomi.com) from the local
+   Chromium-family browser store (Brave/Chrome/Chromium), decrypts them with
+   the browser's libsecret keyring secret, and drives the same silent SSO
+   hop chain the web client uses (serviceLogin -> /sts) to mint a fresh
+   api-platform_serviceToken whenever the previous one expires. Set
+   `{"browser": false}` in the config to disable this.
+2. Manual: a Cookie header pasted into the config file
+   (`{"cookie": "serviceToken=...; userId=..."}`) is used verbatim and wins
+   over the automatic path.
+
+Either way the collector then probes the undocumented console endpoints
+/api/v1/tokenPlan/usage (monthly token window, used/limit/percent) and
+/api/v1/tokenPlan/detail (plan name and current period end). The shape may
+change at any time and any failure there degrades to local stats alone
+without touching the record's readiness. The record is the only contract;
+the agents panel only ever reads the JSON this prints.
 """
 
 from __future__ import annotations
@@ -39,14 +50,16 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Iterator
 
 AGENT_ID = "xiaomi"
 AGENT_NAME = "Xiaomi"
 AUTH_HELP_NO_LIMITS = (
-  "Token counts update locally. For plan limits, paste the platform "
-  "(platform.xiaomimimo.com) session Cookie into ~/.config/omarchy/agents/xiaomi.json."
+  "Token counts update locally. Plan limits renew automatically from the "
+  "browser's Xiaomi session (Brave/Chrome/Chromium); or paste the platform "
+  "Cookie into ~/.config/omarchy/agents/xiaomi.json."
 )
 
 # OpenAI-compatible token-plan hosts (where the tp- key works for inference).
@@ -63,6 +76,19 @@ ITEM_LABELS = {
   "month_total_token": "Monthly tokens",
   "compensation_total_token": "Compensation tokens",
 }
+
+# Chromium-family browsers whose cookie store may hold the Xiaomi account
+# session, mapped to their libsecret application name. Default profile first.
+BROWSERS = (
+  ("BraveSoftware/Brave-Browser", "brave"),
+  ("google-chrome", "chrome"),
+  ("chromium", "chromium"),
+)
+# A minted service token is reused until the console rejects it; the SSO
+# mint itself is rate-limited by this floor so a flapping console cannot
+# turn into a login-storm.
+MINT_MIN_INTERVAL_SECONDS = 300
+SSO_HOP_LIMIT = 8
 
 # Every provider id opencode records for Xiaomi-hosted traffic. The gate
 # keeps '"xiaomi' unterminated so xiaomi-token-plan-* variants pass it too.
@@ -273,8 +299,9 @@ def credentials() -> tuple[str, str]:
   """Return (api_key, cookie).
 
   The api key only proves which account is in play (the collector never
-  calls an inference-host endpoint with it today); the cookie, when the user
-  supplies one, is what unlocks the console limits probe.
+  calls an inference-host endpoint with it today); a *manual* cookie from
+  the config is what this returns — the automatic SSO renewal is resolved
+  separately in scan() so it can piggyback on the same caches.
   """
   config = read_config()
   api_key = str(config.get("apiKey") or "").strip()
@@ -473,6 +500,14 @@ def collect_limits(cookie: str, force: bool) -> dict[str, Any]:
         return result
 
     probe = fetch_limits(cookie)
+    if probe.get("cookieExpired"):
+      # The cookie outlived its welcome — minted or manually pasted: drop
+      # it, mint a fresh one through the SSO hop, and retry once. A manual
+      # cookie is skipped for the retry since it is what just failed.
+      drop_minted_session()
+      fresh = session_cookie(skip_manual=True)
+      if fresh and fresh != cookie:
+        probe = fetch_limits(fresh)
     if probe.get("limits"):
       result["limits"] = probe["limits"]
       result["tierLabel"] = probe.get("tierLabel", "")
@@ -488,6 +523,238 @@ def collect_limits(cookie: str, force: bool) -> dict[str, Any]:
 
   result["usageStatusText"] = probe.get("status", "")
   return result
+
+
+# --------------------------------------------------------------------------
+# Automatic session renewal (browser store -> SSO -> fresh service token)
+# --------------------------------------------------------------------------
+
+def _openssl_cbc_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes | None:
+  """AES-128-CBC via the openssl CLI, so the collector stays stdlib-only.
+
+  Padding is stripped here (PKCS7) and validated; anything malformed
+  returns None rather than garbage.
+  """
+  import subprocess
+
+  try:
+    proc = subprocess.run(
+      ["openssl", "enc", "-d", "-aes-128-cbc", "-nopad", "-K", key.hex(), "-iv", iv.hex()],
+      input=ciphertext, capture_output=True, timeout=10,
+    )
+  except (OSError, subprocess.TimeoutExpired):
+    return None
+  plain = proc.stdout
+  if not plain or len(plain) % 16:
+    return None
+  pad = plain[-1]
+  if 1 <= pad <= 16 and plain[-pad:] == bytes([pad]) * pad:
+    return plain[:-pad]
+  return None
+
+
+def _keyring_secret(application: str) -> str | None:
+  import subprocess
+
+  try:
+    proc = subprocess.run(
+      ["secret-tool", "lookup", "application", application],
+      capture_output=True, timeout=10,
+    )
+  except (OSError, subprocess.TimeoutExpired):
+    return None
+  secret = proc.stdout.decode("utf-8", "replace").strip()
+  return secret or None
+
+
+def browser_account_cookies() -> str | None:
+  """Decrypt account.xiaomi.com cookies from a local Chromium-family store.
+
+  Cookie values live as v11-prefixed blobs: 3-byte tag, a 32-byte header
+  whose second half is the CBC IV, then ciphertext under a key derived as
+  PBKDF2-HMAC-SHA1(browser keyring secret, "saltysalt", 1 iter, 16 bytes).
+  Every step is best-effort: a missing secret-tool, a locked keyring, or an
+  incompatible layout just means no automatic renewal this round.
+  """
+  import shutil
+  import sqlite3
+
+  config = read_config()
+  if config.get("browser") is False:
+    return None
+
+  for family, application in BROWSERS:
+    browser_root = Path.home() / ".config" / family
+    if not browser_root.is_dir():
+      continue
+    profile_dirs = [browser_root / "Default"] + sorted(
+      p for p in browser_root.iterdir() if p.is_dir() and p.name not in ("Default", "System Profile", "Guest Profile")
+    )
+    for profile in profile_dirs:
+      db = profile / "Cookies"
+      if not db.is_file():
+        continue
+      secret = _keyring_secret(application)
+      if not secret:
+        continue
+      key = hashlib.pbkdf2_hmac("sha1", secret.encode("utf-8"), b"saltysalt", 1, 16)
+      tmp = None
+      try:
+        handle_fd, tmp_name = tempfile.mkstemp(suffix=".sqlite")
+        os.close(handle_fd)
+        tmp = Path(tmp_name)
+        shutil.copy2(db, tmp)
+        conn = sqlite3.connect(f"file:{tmp}?immutable=1", uri=True)
+        rows = conn.execute(
+          "SELECT host_key, name, encrypted_value FROM cookies"
+          " WHERE host_key LIKE '%account.xiaomi.com'"
+        ).fetchall()
+        conn.close()
+      except (OSError, sqlite3.Error):
+        continue
+      finally:
+        if tmp is not None:
+          tmp.unlink(missing_ok=True)
+      jar: dict[str, str] = {}
+      for _host, name, enc in rows:
+        if not isinstance(enc, (bytes, bytearray)) or len(enc) < 51:
+          continue
+        plain = _openssl_cbc_decrypt(key, bytes(enc[19:35]), bytes(enc[35:]))
+        if plain is None:
+          continue
+        try:
+          jar[name] = plain.decode("utf-8")
+        except UnicodeDecodeError:
+          continue
+      if "passToken" in jar:
+        return "; ".join(f"{k}={v}" for k, v in jar.items())
+  return None
+
+
+def mint_service_token(account_cookie: str) -> dict[str, str] | None:
+  """Run the console's silent SSO hop chain to mint a fresh service token.
+
+  Mirrors what the web client does when its api-platform_serviceToken
+  expires: take the loginUrl the 401 carries, present the Xiaomi account
+  cookies to serviceLogin, then follow the redirect chain (cookies only
+  ever sent to xiaomi.com hosts) until /sts lands the new token in
+  Set-Cookie. Returns the minted cookie pairs, or None on any miss.
+  """
+  class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # noqa: ARG002
+      return None
+
+  opener = urllib.request.build_opener(_NoRedirect)
+  base_headers = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
+    "Accept": "application/json",
+  }
+
+  # The loginUrl rides on the 401 any console API returns unauthenticated.
+  try:
+    opener.open(
+      urllib.request.Request(CONSOLE_ORIGIN + USAGE_PATH, headers=base_headers),
+      timeout=15,
+    )
+    return None
+  except urllib.error.HTTPError as error:
+    if error.code != 401:
+      return None
+    try:
+      login_url = str(json.loads(error.read()).get("loginUrl") or "")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+      return None
+  except (urllib.error.URLError, TimeoutError):
+    return None
+  if "serviceLogin" not in login_url:
+    return None
+
+  current = login_url
+  minted: dict[str, str] = {}
+  for _hop in range(SSO_HOP_LIMIT):
+    host = urlparse(current).netloc
+    headers = dict(base_headers)
+    if host.endswith("xiaomi.com"):
+      headers["Cookie"] = account_cookie
+    try:
+      response = opener.open(urllib.request.Request(current, headers=headers), timeout=15)
+    except urllib.error.HTTPError as error:
+      for value in error.headers.get_all("Set-Cookie") or []:
+        pair = value.split(";")[0]
+        if "=" in pair:
+          name, _, value_part = pair.partition("=")
+          minted[name.strip()] = value_part.strip()
+      location = error.headers.get("Location") or ""
+      if not location:
+        break
+      current = location if location.startswith("http") else f"https://{host}{location}"
+      continue
+    except (urllib.error.URLError, TimeoutError):
+      return None
+    for value in response.headers.get_all("Set-Cookie") or []:
+      pair = value.split(";")[0]
+      if "=" in pair:
+        name, _, value_part = pair.partition("=")
+        minted[name.strip()] = value_part.strip()
+    break
+
+  if not minted.get("api-platform_serviceToken"):
+    return None
+  wanted = ("api-platform_serviceToken", "userId", "api-platform_slh", "api-platform_ph")
+  return {k: v for k, v in minted.items() if k in wanted}
+
+
+def session_cookie(skip_manual: bool = False) -> str:
+  """Resolve the console Cookie header, manual first, minted second.
+
+  Minted tokens are cached until the console rejects them; collect_limits
+  drops the cache on a cookie-expired reply so the next refresh mints a
+  fresh one. A mint attempt is also floored by MINT_MIN_INTERVAL_SECONDS so
+  a hard failure cannot become a login-storm against account.xiaomi.com.
+  skip_manual bypasses a config cookie — used when that very cookie has
+  just been rejected, so an expired manual paste falls back to renewal.
+  """
+  config = read_config()
+  manual = str(config.get("cookie") or "").strip()
+  if manual and not skip_manual:
+    return manual
+
+  cache_file = cache_root() / "xiaomi-session.json"
+  cached = read_fresh_json(cache_file, float("inf"))
+  if isinstance(cached, dict) and cached.get("cookie"):
+    return str(cached["cookie"])
+
+  with exclusive_lock(cache_root() / "xiaomi-session.lock"):
+    cached = read_fresh_json(cache_file, float("inf"))
+    if isinstance(cached, dict) and cached.get("cookie"):
+      return str(cached["cookie"])
+    minted_at = number(cached.get("mintedAtMs")) / 1000 if isinstance(cached, dict) else 0
+    if time.time() - minted_at < MINT_MIN_INTERVAL_SECONDS:
+      return ""
+    account_cookie = browser_account_cookies()
+    if not account_cookie:
+      return ""
+    pairs = mint_service_token(account_cookie)
+    if not pairs:
+      try:
+        write_json(cache_file, {"mintedAtMs": round(time.time() * 1000), "cookie": ""})
+      except Exception:
+        pass
+      return ""
+    cookie = "; ".join(f"{k}={v}" for k, v in pairs.items())
+    try:
+      write_json(cache_file, {"mintedAtMs": round(time.time() * 1000), "cookie": cookie})
+    except Exception as exc:
+      print(f"omarchy-agent-usage-xiaomi: could not cache session ({exc})", file=sys.stderr)
+    return cookie
+
+
+def drop_minted_session() -> None:
+  """Forget the minted token so the next refresh re-mints it."""
+  try:
+    (cache_root() / "xiaomi-session.json").unlink(missing_ok=True)
+  except OSError:
+    pass
 
 
 # --------------------------------------------------------------------------
@@ -746,6 +1013,8 @@ def scan(force: bool) -> dict[str, Any]:
   record.update(cached_local_stats(max_age))
 
   api_key, cookie = credentials()
+  if not cookie:
+    cookie = session_cookie()
   if cookie:
     limits = collect_limits(cookie, force)
     record["limits"] = limits["limits"]
