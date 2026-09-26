@@ -33,6 +33,8 @@ if [[ -d $assets_dir && ( ! -e $assets_dir/xiaomi.svg || ! -e $assets_dir/xiaomi
      install -m 644 "$plugin_dir/assets/xiaomi-light.svg" "$assets_dir/xiaomi-light.svg" 2>/dev/null; then
     echo "xiaomi.agent-usage: restored the Xiaomi panel mark in $assets_dir" >&2
   else
-    echo "xiaomi.agent-usage: Xiaomi panel mark missing; run 'sudo $plugin_dir/install-mark.sh' to restore it" >&2
+    echo "xiaomi.agent-usage: Xiaomi panel mark missing (optional). To restore it run:" >&2
+    echo "  sudo install -m 644 $plugin_dir/assets/xiaomi.svg $assets_dir/xiaomi.svg" >&2
+    echo "  sudo install -m 644 $plugin_dir/assets/xiaomi-light.svg $assets_dir/xiaomi-light.svg" >&2
   fi
 fi

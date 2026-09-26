@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "xiaomi.agent-usage",
   "name": "Xiaomi Agent Usage",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Carlos",
   "description": "Xiaomi MiMo token plan usage (auto-renewing session) for the built-in agents panel.",
   "kinds": [

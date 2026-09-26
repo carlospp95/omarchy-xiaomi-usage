@@ -17,13 +17,21 @@ Or by hand:
 git clone https://github.com/carlospp95/omarchy-xiaomi-usage.git ~/.config/omarchy/plugins/xiaomi.agent-usage
 omarchy-shell shell rescanPlugins
 omarchy plugin enable xiaomi.agent-usage
-sudo ~/.config/omarchy/plugins/xiaomi.agent-usage/install-mark.sh
 ```
 
-The last step installs the Xiaomi brand mark where the built-in agents panel
-resolves it; without it the tab shows the generic bar glyph instead of the
-Xiaomi icon. `refresh.sh` keeps the mark installed afterwards and prints a
-reminder with this command if it ever goes missing.
+Optionally, install the Xiaomi brand mark where the built-in agents panel
+resolves it (two static SVGs copied with plain `install` — no installer
+script is executed as root):
+
+```bash
+sudo install -m 644 ~/.config/omarchy/plugins/xiaomi.agent-usage/assets/xiaomi.svg /usr/share/omarchy/shell/plugins/agents/assets/xiaomi.svg
+sudo install -m 644 ~/.config/omarchy/plugins/xiaomi.agent-usage/assets/xiaomi-light.svg /usr/share/omarchy/shell/plugins/agents/assets/xiaomi-light.svg
+```
+
+The mark is optional: without it the tab shows the generic bar glyph and
+everything else works. `refresh.sh` keeps the mark installed afterwards
+(when the directory is writable) and prints these same commands as a
+reminder if it ever goes missing.
 
 The Xiaomi tab appears in the agents panel once the first record lands
 (within a minute of the shell starting).
@@ -96,11 +104,12 @@ The console cookie resolves in this order:
   half-written record.
 - The panel's brand mark for a tab resolves inside the built-in agents
   plugin (`assets/<id>.svg`), which a third-party plugin can't extend by
-  convention. This plugin bundles its own marks and keeps them installed:
-  `refresh.sh` reinstalls `xiaomi.svg` whenever it goes missing (an omarchy
-  upgrade can wipe the directory), and for a guaranteed install run
-  `sudo ./install-mark.sh` once. Without the mark the tab shows the
-  standard bar glyph.
+  convention. This plugin bundles its own marks and installs them with two
+  plain `sudo install` one-liners (see Install): each command copies one
+  static SVG and its scope is fully visible — no installer script is run as
+  root. `refresh.sh` reinstalls the marks whenever they go missing (an
+  omarchy upgrade can wipe the directory) when the directory is writable.
+  The mark is optional; without it the tab shows the standard bar glyph.
 - Disable or remove with `omarchy plugin disable xiaomi.agent-usage` /
   `omarchy plugin remove xiaomi.agent-usage`. Removing the plugin leaves the
   last `xiaomi.json` behind; delete
